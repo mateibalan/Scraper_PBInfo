@@ -1,3 +1,3 @@
-python3 -m venv spatiu
-cd venv 
-source /Scripts/activate
+python3 -m venv spatiu;
+cd spatiu; 
+source /Scripts/activate;
