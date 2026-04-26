@@ -83,10 +83,10 @@ class Backend:
             )
             if driver.find_elements(By.CSS_SELECTOR, _CSS_PRIVATE):
                 log(f"  -> Profilul lui {username} este privat. Se sare...")
-                return [], [], [], []
+                return False, [], [], [], []
         except Exception:
-            log(f"  -> Timeout / 0 probleme gasite pentru {username}")
-            return [], [], [], []
+            log(f"  -> Timeout / 0 probleme gasite pentru {username} — fisierul existent NU se modifica.")
+            return False, [], [], [], []
 
         buttons = driver.find_elements(By.CSS_SELECTOR, _CSS_BADGES)
         solved_i, solved_l, failed_i, failed_l = [], [], [], []
@@ -105,7 +105,7 @@ class Backend:
                 solved_i.append(text); solved_l.append(link)
 
         log(f"  -> {len(solved_i)} rezolvate, {len(failed_i)} incercari pentru {username}")
-        return solved_i, solved_l, failed_i, failed_l
+        return True, solved_i, solved_l, failed_i, failed_l
 
     def _write_user_csvs(self, username, solved_i, solved_l, failed_i, failed_l) -> None:
         for suffix, items, links in [
@@ -179,10 +179,16 @@ class Backend:
 
     # ── Scraping ──────────────────────────────────────────────────────
 
-    def update_all(self, log, progress, headless: bool = True) -> None:
+    def update_all(self, log, progress, headless: bool = True,
+                   cancel_event: threading.Event | None = None) -> None:
         driver = self.get_driver(headless)
         total = len(self.USERNAMES)
         for i, username in enumerate(self.USERNAMES):
+            # Check cancel BEFORE starting a new user
+            if cancel_event and cancel_event.is_set():
+                log("⚠ Scraping anulat de utilizator.")
+                driver.quit()
+                return
             log(f"[{i+1}/{total}] Scraping: {username}")
             try:
                 driver.get(f"https://www.pbinfo.ro/profil/{username}/probleme")
@@ -196,8 +202,9 @@ class Backend:
                 continue
             if i == 0:
                 self.click_initial_button(driver)
-            s_i, s_l, f_i, f_l = self._scrape_page(driver, username, log)
-            self._write_user_csvs(username, s_i, s_l, f_i, f_l)
+            ok, s_i, s_l, f_i, f_l = self._scrape_page(driver, username, log)
+            if ok:
+                self._write_user_csvs(username, s_i, s_l, f_i, f_l)
             progress((i + 1) / total)
         driver.quit()
         log("✔ Toate fisierele CSV au fost actualizate.")
@@ -222,12 +229,14 @@ class Backend:
             return
         self.click_initial_button(driver)
         log(f"Scraping: {username} ...")
-        s_i, s_l, f_i, f_l = self._scrape_page(driver, username, log)
-        self._write_user_csvs(username, s_i, s_l, f_i, f_l)
+        ok, s_i, s_l, f_i, f_l = self._scrape_page(driver, username, log)
         driver.quit()
-        log(f"✔ Problemele pentru {username} au fost actualizate.")
-        # Auto-rebuild ProblemeAll
-        self.update_probleme_all(log)
+        if ok:
+            self._write_user_csvs(username, s_i, s_l, f_i, f_l)
+            log(f"✔ Problemele pentru {username} au fost actualizate.")
+            self.update_probleme_all(log)
+        else:
+            log(f"⚠ {username}: scraping esuat — fisierul CSV existent nu a fost modificat.")
 
     def update_probleme_all(self, log) -> None:
         count: dict[str, int] = defaultdict(int)
@@ -404,6 +413,8 @@ class UserComboBox(ctk.CTkFrame):
         self._skip_trace  = False   # evita re-intrare in trace la set programatic
         self._bind_global = None    # global click-outside handler funcid
 
+        self._selecting   = False   # True while a list selection is being committed
+
         self._entry = ctk.CTkEntry(
             self, textvariable=self._var,
             width=width - 38, height=34, corner_radius=8,
@@ -421,20 +432,24 @@ class UserComboBox(ctk.CTkFrame):
         )
         self._btn.pack(side="left", padx=(2, 0))
 
-        # Cand utilizatorul da click pe entry: sterge si deschide
-        self._entry._entry.bind("<FocusIn>",  self._on_entry_click)
-        self._entry._entry.bind("<KeyRelease>", self._on_key_release)
-        self._entry._entry.bind("<Down>",      lambda e: (self._ensure_open(), self._move_sel(1)))
-        self._entry._entry.bind("<Up>",        lambda e: (self._ensure_open(), self._move_sel(-1)))
-        self._entry._entry.bind("<Return>",    self._on_enter)
-        self._entry._entry.bind("<Escape>",    lambda e: self._close_dropdown())
+        # <Button-1> instead of <FocusIn>: only a real mouse-click opens the dropdown,
+        # not programmatic focus changes (tab switching, etc.)
+        self._entry._entry.bind("<Button-1>",   self._on_entry_click)
+        self._entry._entry.bind("<KeyRelease>",  self._on_key_release)
+        self._entry._entry.bind("<Down>",        lambda e: (self._ensure_open(), self._move_sel(1)))
+        self._entry._entry.bind("<Up>",          lambda e: (self._ensure_open(), self._move_sel(-1)))
+        self._entry._entry.bind("<Return>",      self._on_enter)
+        self._entry._entry.bind("<Escape>",      lambda e: self._close_dropdown())
 
         self._var.trace_add("write", self._on_trace)
 
     # ── Handlers entry ───────────────────────────────────────────────
 
     def _on_entry_click(self, _event):
-        """Sterge textul existent si deschide dropdown cu toate optiunile."""
+        """Mouse-click on entry: clear text and open dropdown.
+        Guard against the refocus that happens right after a list selection."""
+        if self._selecting:
+            return
         if not self._skip_trace:
             self._skip_trace = True
             self._var.set("")
@@ -583,12 +598,17 @@ class UserComboBox(ctk.CTkFrame):
             self._select_item(self._listbox.get(sel[0]).strip())
 
     def _select_item(self, value: str):
+        self._selecting = True          # prevent _on_entry_click from clearing on refocus
         self._skip_trace = True
         self._var.set(value)
         self._skip_trace = False
         self._close_dropdown()
         if self._on_change:
             self._on_change(value)
+        self.after(150, self._reset_selecting)
+
+    def _reset_selecting(self):
+        self._selecting = False
 
     def _on_global_click(self, event):
         """Inchide dropdown-ul la click in afara lui."""
@@ -646,6 +666,7 @@ class App(ctk.CTk):
         self.geometry("1460x860")
         self.minsize(1120, 700)
         self._all_comboboxes: list[UserComboBox] = []
+        self._cancel_event: threading.Event = threading.Event()
         self._apply_tree_style()
         self._build_ui()
 
@@ -725,6 +746,17 @@ class App(ctk.CTk):
             text_color="#303050", font=ctk.CTkFont(size=9), anchor="w",
         ).pack(anchor="w", padx=16, pady=(10, 0))
 
+        # Cancel button — hidden until scraping starts
+        self._cancel_btn = ctk.CTkButton(
+            self.sidebar, text="⏹  Anuleaza dupa user curent",
+            command=self._request_cancel,
+            width=248, height=38, corner_radius=10,
+            fg_color="#7f1d1d", hover_color="#991b1b",
+            text_color="#fca5a5", font=ctk.CTkFont(size=11, weight="bold"),
+            anchor="w",
+        )
+        # Not packed yet — shown only during scraping
+
         # Divider
         ctk.CTkFrame(self.sidebar, height=1,
                      fg_color="#1e1e30").pack(fill="x", padx=13, pady=(14, 6))
@@ -741,13 +773,22 @@ class App(ctk.CTk):
             ctk.CTkLabel(log_hdr, text=f"● {lbl}", text_color=color,
                 font=ctk.CTkFont(size=11)).pack(side="right", padx=3)
 
-        # Clear-log at the very bottom
+        # Exit App button — always at the very bottom
+        ctk.CTkButton(self.sidebar, text="⏻  Inchide aplicatia",
+            fg_color="#1a0a0a", border_width=1, border_color="#3d1515",
+            text_color="#6b2020", hover_color="#2a0f0f",
+            width=248, height=32, corner_radius=8,
+            font=ctk.CTkFont(size=11, weight="bold"),
+            command=self.destroy,
+        ).pack(side="bottom", padx=13, pady=(4, 10))
+
+        # Clear-log just above exit
         ctk.CTkButton(self.sidebar, text="🗑  Sterge log",
             fg_color="transparent", border_width=1, border_color="#1e1e30",
             text_color="#404060", hover_color="#1a1a2e",
             width=248, height=28, corner_radius=8,
             command=self._clear_log,
-        ).pack(side="bottom", padx=13, pady=(4, 14))
+        ).pack(side="bottom", padx=13, pady=(4, 2))
 
         self.log_box = ctk.CTkTextbox(
             self.sidebar, state="disabled",
@@ -1456,17 +1497,22 @@ class App(ctk.CTk):
 
     # ── Threading ────────────────────────────────────────────────────
 
-    def _run_in_thread(self, fn) -> None:
+    def _run_in_thread(self, fn, show_cancel: bool = False) -> None:
         self._set_buttons("disabled")
         self.set_progress(0)
-        threading.Thread(target=self._thread_wrapper, args=(fn,), daemon=True).start()
+        if show_cancel:
+            self._cancel_event.clear()
+            self.after(0, self._show_cancel_btn)
+        threading.Thread(target=self._thread_wrapper, args=(fn, show_cancel), daemon=True).start()
 
-    def _thread_wrapper(self, fn) -> None:
+    def _thread_wrapper(self, fn, show_cancel: bool = False) -> None:
         try:
             fn()
         except Exception as exc:
             self.log(f"❌ Eroare neasteptata: {exc}")
         finally:
+            if show_cancel:
+                self.after(0, self._hide_cancel_btn)
             self.after(0, self._set_buttons, "normal")
             self.set_status("Gata.")
             self.after(150, self._refresh_file_list)
@@ -1481,15 +1527,32 @@ class App(ctk.CTk):
         for btn in self._action_buttons:
             btn.configure(state=state)
 
+    def _show_cancel_btn(self) -> None:
+        self._cancel_btn.pack(padx=13, pady=(3, 3))
+
+    def _hide_cancel_btn(self) -> None:
+        self._cancel_btn.pack_forget()
+
+    def _request_cancel(self) -> None:
+        self._cancel_event.set()
+        self._cancel_btn.configure(
+            text="⏳  Anulare in curs...",
+            state="disabled",
+            fg_color="#4a1010",
+            text_color="#f87171",
+        )
+        self.set_status("⏹ Anulare dupa utilizatorul curent...")
+
     # ── Callbacks butoane ─────────────────────────────────────────────
 
     def _run_update_all(self) -> None:
         hl = self.headless_var.get()
         def task():
             self.set_status("Se actualizeaza toti utilizatorii...")
-            self.backend.update_all(self.log, self.set_progress, headless=hl)
+            self.backend.update_all(self.log, self.set_progress,
+                                    headless=hl, cancel_event=self._cancel_event)
             self.set_progress(1.0)
-        self._run_in_thread(task)
+        self._run_in_thread(task, show_cancel=True)
 
     def _run_update_all_csv(self) -> None:
         def task():
